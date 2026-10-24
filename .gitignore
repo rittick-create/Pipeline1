@@ -1,13 +1,28 @@
+# Local datasets and independent reference repositories
+/symile-mimic/
+/Pacx mae original/
+/DrFusePipeline/
+
+# Local notebook used to inspect/test the Pipeline2 DataLoader
+/Pipeline2/dataset/symile_dataloader.ipynb
+
+# Python environments, secrets, and caches
 __pycache__/
 *.py[cod]
+.ipynb_checkpoints/
 .venv/
 venv/
 .env
 .env.*
 !.env.example
+
+# Training outputs and large data/model artifacts
 wandb/
 lightning_logs/
 checkpoints/
 *.ckpt
 *.pth
 *.pt
+*.npy
+*.npz
+*.safetensors
