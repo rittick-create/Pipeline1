@@ -3,9 +3,6 @@
 /Pacx mae original/
 /DrFusePipeline/
 
-# Local notebook used to inspect/test the Pipeline2 DataLoader
-/Pipeline2/dataset/symile_dataloader.ipynb
-
 # Python environments, secrets, and caches
 __pycache__/
 *.py[cod]
