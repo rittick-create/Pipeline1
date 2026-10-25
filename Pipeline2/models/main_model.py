@@ -10,7 +10,7 @@ from .labs_mlp import LabsMLP
 
 
 class MainModel(nn.Module):
-    def __init__(self, hidden_size=256, num_classes=5,
+    def __init__(self, hidden_size=256, num_classes=14,
                  ecg_dropout=0.3, ecg_n_layers=1, ecg_n_head=8,
                  labs_dropout=0.3):
         super().__init__()

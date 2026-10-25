@@ -18,7 +18,7 @@ class LearnablePositionalEncoding(nn.Module):
         return self.dropout(x)
 
 class ECGTransformer(nn.Module):
-    def __init__(self, input_size=12, num_classes=5,
+    def __init__(self, input_size=12, num_classes=14,
                  d_model=256, n_head=8, n_layers_feat=1,
                  n_layers_shared=1, n_layers_distinct=1,
                  dropout=0.3, max_len=5000):

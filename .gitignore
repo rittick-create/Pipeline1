@@ -14,6 +14,7 @@ venv/
 !.env.example
 
 # Training outputs and large data/model artifacts
+/Pipeline2/runs*/
 wandb/
 lightning_logs/
 checkpoints/

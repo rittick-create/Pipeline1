@@ -1,4 +1,4 @@
-"""Load SYMILE-MIMIC inputs and clinical labels for five-finding prediction.
+"""Load SYMILE-MIMIC inputs and all 14 CheXpert labels.
 
 Label mask: explicit 0/1 are valid; NaN/-1 are ignored.
 Modality mask order: CXR, ECG, labs. Only CXR is deliberately hidden.
@@ -15,9 +15,18 @@ from torch.utils.data import Dataset, DataLoader
 TARGETS = [
     "Atelectasis",
     "Cardiomegaly",
+    "Consolidation",
     "Edema",
+    "Enlarged Cardiomediastinum",
+    "Fracture",
+    "Lung Lesion",
     "Lung Opacity",
+    "No Finding",
     "Pleural Effusion",
+    "Pleural Other",
+    "Pneumonia",
+    "Pneumothorax",
+    "Support Devices",
 ]
 MODALITIES = ("cxr", "ecg", "labs")
 
