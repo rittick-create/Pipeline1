@@ -1,0 +1,19 @@
+flowchart TD
+    Train["Train once with CXR + ECG + labs\nValidate with all inputs\nSelect best macro AP checkpoint"]
+    Train --> Checkpoint["One frozen checkpoint\nSame final prediction head"]
+    Checkpoint --> All["All test inputs\nCXR + ECG + labs"]
+    Checkpoint --> CXR["CXR-only test\nNo ECG or lab input keys or file reads"]
+    Checkpoint --> EL["ECG + labs test\nNo CXR input key or file read"]
+    All --> EncodeAll["Run CXR, ECG and lab encoders\nShared and distinct representations"]
+    CXR --> EncodeCXR["Run CXR encoder only\nCXR shared and distinct"]
+    EL --> EncodeEL["Run ECG and lab encoders only\nECG and lab shared and distinct"]
+    EncodeAll --> FuseAll["Logit pooling of 3 shared vectors"]
+    EncodeCXR --> FuseCXR["CXR shared vector\nSingle-input fusion is identity"]
+    EncodeEL --> FuseEL["Logit pooling of 2 shared vectors"]
+    FuseAll --> AttentionAll["4 tokens: ECG distinct, labs distinct, shared, CXR distinct\nAttention weights B x 14 x 4"]
+    FuseCXR --> AttentionCXR["2 tokens: shared, CXR distinct\nAttention weights B x 14 x 2"]
+    FuseEL --> AttentionEL["3 tokens: ECG distinct, labs distinct, shared\nAttention weights B x 14 x 3"]
+    AttentionAll --> Final["Finding representations B x 14 x 256\nSame Linear 256 to 14\nDiagonal + sigmoid gives B x 14 probabilities"]
+    AttentionCXR --> Final
+    AttentionEL --> Final
+    Final --> Compare["Compare final-head AP and AUROC\nSame 464 admissions and known label entries\nReport per-finding scores and original label counts"]

@@ -1,7 +1,7 @@
 """Load SYMILE-MIMIC inputs and all 14 CheXpert labels.
 
 Label mask: explicit 0/1 are valid; NaN/-1 are ignored.
-Modality mask order: CXR, ECG, labs. Only CXR is deliberately hidden.
+Train and validation use every modality. Test views omit excluded input keys.
 """
 
 from pathlib import Path
@@ -29,58 +29,62 @@ TARGETS = [
     "Support Devices",
 ]
 MODALITIES = ("cxr", "ecg", "labs")
+TEST_CONDITIONS = {
+    "all": MODALITIES,
+    "cxr_only": ("cxr",),
+    "ecg_labs": ("ecg", "labs"),
+}
 
 
 class SymileMIMICDataset(Dataset):
-    def __init__(self, dataset_root, split="train", cxr_missing_ratio=0.30,seed=42):
-
-        #chech the validity of the input arguments
+    def __init__(self, dataset_root, split="train", modalities=MODALITIES):
         if split not in ("train", "val", "test"):
             raise ValueError("split must be train, val, or test.")
-        if not 0 <= cxr_missing_ratio <= 1:
-            raise ValueError("cxr_missing_ratio must be between 0 and 1.")
-
+        if isinstance(modalities, str):
+            raise ValueError("Pass modality names as a tuple, such as ('cxr',).")
+        modalities = tuple(modalities)
+        if (not modalities or len(set(modalities)) != len(modalities)
+                or not set(modalities).issubset(MODALITIES)):
+            raise ValueError("Choose one or more distinct modalities: cxr, ecg, labs.")
+        self.modalities = tuple(name for name in MODALITIES if name in modalities)
+        if split != "test" and self.modalities != MODALITIES:
+            raise ValueError("Training and validation require all three modalities.")
 
         self.split = split
-        self.cxr_missing_ratio = cxr_missing_ratio
         self.CLASSES = TARGETS.copy()
-        self.rng = np.random.default_rng(seed)
 
         root = Path(dataset_root).expanduser().resolve()
         split_dir = root / "data_npy" / split
 
 
-        # Open the preprocessed arrays without loading them all into RAM.
-
-        self.cxr = np.load(split_dir / f"cxr_{split}.npy", mmap_mode="r")
-        self.ecg = np.load(split_dir / f"ecg_{split}.npy", mmap_mode="r")
-        self.labs_percentiles = np.load(
-            split_dir / f"labs_percentiles_{split}.npy", mmap_mode="r"
-        )
-        # 1 means observed and 0 means missing.
-        self.labs_observed = np.load(
-            split_dir / f"labs_missingness_{split}.npy", mmap_mode="r"
-        )
+        # IDs are always needed; excluded modality files are never opened.
         array_ids = np.load(
             split_dir / f"hadm_id_{split}.npy", mmap_mode="r"
         ).reshape(-1)
 
-        #can remove this check after the run ...just for checking the validity of the input arrays
-        n = len(self.cxr)
+        n = len(array_ids)
         if n == 0:
             raise ValueError("The input arrays are empty.")
-        if self.cxr.shape != (n, 3, 320, 320):
-            raise ValueError("Expected CXR shape (N, 3, 320, 320).")
-        if self.ecg.shape != (n, 1, 5000, 12):
-            raise ValueError("Expected ECG shape (N, 1, 5000, 12).")
-        if self.labs_percentiles.shape != (n, 50):
-            raise ValueError("Expected lab percentiles shaped (N, 50).")
-        if self.labs_observed.shape != (n, 50):
-            raise ValueError("Expected lab indicators shaped (N, 50).")
-        if len(array_ids) != n:
-            raise ValueError("Admission IDs and inputs have different lengths.")
-        if not np.isin(self.labs_observed, [0, 1]).all():
-            raise ValueError("Lab indicators must contain only 0 and 1.")
+        if "cxr" in self.modalities:
+            self.cxr = np.load(split_dir / f"cxr_{split}.npy", mmap_mode="r")
+            if self.cxr.shape != (n, 3, 320, 320):
+                raise ValueError("Expected CXR shape (N, 3, 320, 320).")
+        if "ecg" in self.modalities:
+            self.ecg = np.load(split_dir / f"ecg_{split}.npy", mmap_mode="r")
+            if self.ecg.shape != (n, 1, 5000, 12):
+                raise ValueError("Expected ECG shape (N, 1, 5000, 12).")
+        if "labs" in self.modalities:
+            self.labs_percentiles = np.load(
+                split_dir / f"labs_percentiles_{split}.npy", mmap_mode="r"
+            )
+            # Despite the filename, 1 means observed and 0 means missing.
+            self.labs_observed = np.load(
+                split_dir / f"labs_missingness_{split}.npy", mmap_mode="r"
+            )
+            if self.labs_percentiles.shape != (n, 50) or self.labs_observed.shape != (n, 50):
+                raise ValueError("Expected lab values and indicators shaped (N, 50).")
+            if not np.isin(self.labs_observed, [0, 1]).all():
+                raise ValueError("Lab indicators must contain only 0 and 1.")
 
         # Read clinical targets and check their alignment with the inputs.
         # This is needed as we are building the dataset from the CSV files and the NPY arrays.
@@ -139,69 +143,62 @@ class SymileMIMICDataset(Dataset):
 
 
 
-        # Fix the hidden CXR samples for validation/test only.
-        # Training samples receive a fresh random decision in __getitem__.
-
-        self.fixed_cxr_available = np.ones(len(self.indices), dtype=bool)
-        if split != "train":
-            n_hidden = round(cxr_missing_ratio * len(self.indices))
-            hidden_indices = self.rng.permutation(len(self.indices))[:n_hidden]
-            self.fixed_cxr_available[hidden_indices] = False
-
     def __len__(self):
         return len(self.indices)
 
-    #retrieves one adm's input ,labels and masks.
-    #Dataloader calls it to collect a batch of samples.
     def __getitem__(self, index):
+        """Return available inputs and targets for one admission, without padding."""
         row = int(self.indices[index])
-
-        if self.split == "train":
-            cxr_available = self.rng.random() >= self.cxr_missing_ratio
-        else:
-            cxr_available = bool(self.fixed_cxr_available[index])
-
-        # torch.tensor copies each selected slice into writable tensor memory.
-        #an availiable CXR is a 3x320x320 tensor, otherwise a zero tensor of the same shape.
-        if cxr_available:
-            cxr = torch.tensor(self.cxr[row], dtype=torch.float32)
-        else:
-            cxr = torch.zeros((3, 320, 320), dtype=torch.float32)
-
-        ecg = torch.tensor(self.ecg[row], dtype=torch.float32)
-        labs_percentiles = torch.tensor(self.labs_percentiles[row], dtype=torch.float32)
-        labs_observed = torch.tensor(self.labs_observed[row], dtype=torch.float32)
-        labs = torch.cat([labs_percentiles, labs_observed])
-
-        return {
-            "cxr": cxr,
-            "ecg": ecg,
-            "labs": labs,
+        sample = {
             "labels": torch.tensor(self.labels[index], dtype=torch.float32),
             "label_mask": torch.tensor(self.label_masks[index], dtype=torch.bool),
-            "modality_mask": torch.tensor([cxr_available, True, True], dtype=torch.bool),
             "hadm_id": torch.tensor(int(self.hadm_ids[index]), dtype=torch.long),
         }
+        # torch.tensor copies each memory-mapped slice to writable tensor memory.
+        if "cxr" in self.modalities:
+            sample["cxr"] = torch.tensor(self.cxr[row], dtype=torch.float32)
+        if "ecg" in self.modalities:
+            sample["ecg"] = torch.tensor(self.ecg[row], dtype=torch.float32)
+        if "labs" in self.modalities:
+            values = torch.tensor(self.labs_percentiles[row], dtype=torch.float32)
+            observed = torch.tensor(self.labs_observed[row], dtype=torch.float32)
+            sample["labs"] = torch.cat([values, observed])
+        return sample
+
+    def label_counts(self):
+        """Count original labels, before replacing unknown targets with zeros."""
+        return pd.DataFrame({
+            "finding": TARGETS,
+            "positive": (self.raw_labels == 1).sum(axis=0),
+            "negative": (self.raw_labels == 0).sum(axis=0),
+            "uncertain": (self.raw_labels == -1).sum(axis=0),
+            "unreported": np.isnan(self.raw_labels).sum(axis=0),
+        })
 
 
-def create_dataloaders(dataset_root, batch_size=16, train_missing_ratio=0.30,
-                       val_missing_ratio=0.30, test_missing_ratio=0.30,
-                       num_workers=0, seed=42):
-    """Wrap the existing splits in batch loaders, without splitting again."""
+def create_test_dataloaders(dataset_root, batch_size=8, num_workers=0, seed=42):
+    """Three views of the same test admissions, with only selected input keys."""
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     if num_workers != 0:
         raise ValueError("Use num_workers=0 in this introductory implementation.")
 
-    train_dataset = SymileMIMICDataset(
-        dataset_root, split="train", cxr_missing_ratio=train_missing_ratio, seed=seed
-    )
-    val_dataset = SymileMIMICDataset(
-        dataset_root, split="val", cxr_missing_ratio=val_missing_ratio, seed=seed
-    )
-    test_dataset = SymileMIMICDataset(
-        dataset_root, split="test", cxr_missing_ratio=test_missing_ratio, seed=seed
-    )
+    return {
+        condition: DataLoader(
+            SymileMIMICDataset(dataset_root, split="test", modalities=modalities),
+            batch_size=batch_size, shuffle=False, num_workers=0,
+            generator=torch.Generator().manual_seed(seed + 2),
+        )
+        for condition, modalities in TEST_CONDITIONS.items()
+    }
+
+
+def create_dataloaders(dataset_root, batch_size=8, num_workers=0, seed=42):
+    """Return complete train/val loaders and a dictionary of three test loaders."""
+    test_loaders = create_test_dataloaders(dataset_root, batch_size, num_workers, seed)
+    train_dataset = SymileMIMICDataset(dataset_root, split="train")
+    val_dataset = SymileMIMICDataset(dataset_root, split="val")
+    test_dataset = test_loaders["all"].dataset
 
     # Verify the supplied patient separation; do not move or drop patients.
     train_patients = set(train_dataset.subject_ids)
@@ -218,8 +215,4 @@ def create_dataloaders(dataset_root, batch_size=16, train_missing_ratio=0.30,
         val_dataset, batch_size=batch_size, shuffle=False, num_workers=0,
         generator=torch.Generator().manual_seed(seed + 1),
     )
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=0,
-        generator=torch.Generator().manual_seed(seed + 2),
-    )
-    return train_loader, val_loader, test_loader
+    return train_loader, val_loader, test_loaders

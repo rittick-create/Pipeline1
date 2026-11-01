@@ -48,6 +48,7 @@ class MainTrainer(pl.LightningModule):
         )
 
         self.save_hyperparameters(args)  # args goes to self.hparams.
+        self.save_hyperparameters({"label_names": list(label_names)})
 
         self.pred_criterion = nn.BCELoss(reduction="none")
         self.alignment_cos_sim = nn.CosineSimilarity(dim=1)
@@ -61,14 +62,11 @@ class MainTrainer(pl.LightningModule):
         self.val_modality_masks = []
 
         self.test_preds = []
+        self.test_hadm_ids = []
         self.test_labels = []
         self.test_label_masks = []
         self.test_modality_masks = []
-        self.test_feats = {k: [] for k in [
-            "feat_ecg_shared", "feat_ecg_distinct",
-            "feat_labs_shared", "feat_labs_distinct",
-            "feat_cxr_shared", "feat_cxr_distinct",
-        ]}
+        self.test_feats = {}
         self.test_attns = []
 
         self.label_names = label_names
@@ -259,24 +257,28 @@ class MainTrainer(pl.LightningModule):
         return loss_total
 
     def _get_batch_data(self, batch):
-        ecg = batch["ecg"].float().to(self.device)
-        labs = batch["labs"].float().to(self.device)
-        cxr = batch["cxr"].float().to(self.device)
+        inputs = {name: batch[name].float().to(self.device)
+                  for name in ("cxr", "ecg", "labs") if name in batch}
         y = batch["labels"].float().to(self.device)
         label_mask = batch["label_mask"].bool().to(self.device)
-        modality_mask = batch["modality_mask"].bool().to(self.device)
-        return ecg, labs, cxr, y, label_mask, modality_mask
+        return inputs, y, label_mask
+
+    def _complete_inputs(self, batch):
+        inputs, y, label_mask = self._get_batch_data(batch)
+        if set(inputs) != {"cxr", "ecg", "labs"}:
+            raise ValueError("Training and validation require all three modalities.")
+        return inputs, y, label_mask
 
     def training_step(self, batch, batch_idx):
-        ecg, labs, cxr, y, label_mask, modality_mask = self._get_batch_data(batch)
-        # CXR hiding is already handled by the Dataset; use its mask directly.
-        out = self.model(ecg, labs, cxr, modality_mask)
+        inputs, y, label_mask = self._complete_inputs(batch)
+        out = self.model(**inputs)
         return self._compute_and_log_loss(
-            out, y_gt=y, label_mask=label_mask, modality_mask=modality_mask)
+            out, y_gt=y, label_mask=label_mask, modality_mask=out["modality_mask"])
 
     def validation_step(self, batch, batch_idx):
-        ecg, labs, cxr, y, label_mask, modality_mask = self._get_batch_data(batch)
-        out = self.model(ecg, labs, cxr, modality_mask)
+        inputs, y, label_mask = self._complete_inputs(batch)
+        out = self.model(**inputs)
+        modality_mask = out["modality_mask"]
         loss = self._compute_and_log_loss(
             out, y_gt=y, label_mask=label_mask,
             modality_mask=modality_mask, mode="val")
@@ -322,15 +324,15 @@ class MainTrainer(pl.LightningModule):
             mlaps, mlroc = self._compute_masked_metrics(preds, y_gt, mask)
 
             if name == "final":
-                self.log("Val_PRAUC", mlaps.nanmean(), logger=False, prog_bar=True)
+                self.log("Val_AP", mlaps.nanmean(), logger=False, prog_bar=True)
                 self.log("Val_AUROC", mlroc.nanmean(), logger=False, prog_bar=True)
 
             log_dict = {
-                f"val_PRAUC_avg_over_dxs/{name}": mlaps.nanmean(),
+                f"val_AP_avg_over_dxs/{name}": mlaps.nanmean(),
                 f"val_AUROC_avg_over_dxs/{name}": mlroc.nanmean(),
             }
             for i, label in enumerate(self.label_names):
-                log_dict[f"val_PRAUC_per_dx_{name}/{label}"] = mlaps[i]
+                log_dict[f"val_AP_per_dx_{name}/{label}"] = mlaps[i]
                 log_dict[f"val_AUROC_per_dx_{name}/{label}"] = mlroc[i]
             self.log_dict(log_dict)
 
@@ -340,17 +342,37 @@ class MainTrainer(pl.LightningModule):
         self.val_label_masks.clear()
         self.val_modality_masks.clear()
 
+    def on_test_epoch_start(self):
+        # Each test call evaluates one condition; nothing carries into the next.
+        self.test_preds.clear()
+        self.test_hadm_ids.clear()
+        self.test_labels.clear()
+        self.test_label_masks.clear()
+        self.test_modality_masks.clear()
+        self.test_attns.clear()
+        self.test_feats.clear()
+        self.test_results = None
+        self.test_modalities = None
+        self.test_token_names = None
+
     def test_step(self, batch, batch_idx):
-        ecg, labs, cxr, y, label_mask, modality_mask = self._get_batch_data(batch)
-        out = self.model(ecg, labs, cxr, modality_mask)
+        inputs, y, label_mask = self._get_batch_data(batch)
+        out = self.model(**inputs)
+        if self.test_modalities is None:
+            self.test_modalities = out["modalities"]
+            self.test_token_names = out["attn_token_names"]
+        elif self.test_modalities != out["modalities"]:
+            raise ValueError("Use a separate test call for each input condition.")
 
         self.test_preds.append(out["pred_final"].detach().cpu())
+        self.test_hadm_ids.append(batch["hadm_id"].detach().cpu())
         self.test_labels.append(y.detach().cpu())
         self.test_label_masks.append(label_mask.cpu())
-        self.test_modality_masks.append(modality_mask.cpu())
+        self.test_modality_masks.append(out["modality_mask"].cpu())
         self.test_attns.append(out["attn_weights"].detach().cpu())
-        for k in self.test_feats:
-            self.test_feats[k].append(out[k].detach().cpu())
+        for k, value in out.items():
+            if k.startswith("feat_") and k.endswith(("_shared", "_distinct")):
+                self.test_feats.setdefault(k, []).append(value.detach().cpu())
 
     def on_test_epoch_end(self):
         if not self.test_labels:
@@ -362,25 +384,34 @@ class MainTrainer(pl.LightningModule):
         attn_weights = torch.cat(self.test_attns, dim=0)
         mlaps, mlroc = self._compute_masked_metrics(preds, y_gt, label_mask)
         self.test_results = {
+            "hadm_ids": torch.cat(self.test_hadm_ids, dim=0),
             "y_gt": y_gt,
             "preds": preds,
             "label_mask": label_mask,
             "modality_mask": modality_mask,
             "mlaps": mlaps,
             "mlroc": mlroc,
-            "prauc": mlaps.nanmean().item(),
+            "ap": mlaps.nanmean().item(),
             "auroc": mlroc.nanmean().item(),
             "attn_weight": attn_weights,
             "label_names": self.label_names,
+            "modalities": self.test_modalities,
+            "attn_token_names": self.test_token_names,
         }
         for k in self.test_feats:
             self.test_results[k] = torch.cat(self.test_feats[k], dim=0)
             self.test_feats[k].clear()
         self.test_labels.clear()
+        self.test_hadm_ids.clear()
         self.test_preds.clear()
         self.test_label_masks.clear()
         self.test_modality_masks.clear()
         self.test_attns.clear()
+        self.test_feats.clear()
+
+        condition = "_".join(self.test_modalities)
+        self.log(f"test_AP/{condition}", mlaps.nanmean())
+        self.log(f"test_AUROC/{condition}", mlroc.nanmean())
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.hparams.lr,
