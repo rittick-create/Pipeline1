@@ -15,10 +15,6 @@ Our intended direction is ECG + labs predicting a frozen CXR embedding. The Stag
 
 Original paths, imports, dependencies, and behavior are preserved. This includes the MAE mask-ratio mismatch and the lab script loading data and starting training at import time. No fixes, notebook extraction, package installation, checkpoint downloads, or training were performed.
 
-## Subsequent reversed Stage 2 work
-
-The original copied Stage 2 files remain unchanged as references. Reversed Stage 2 lives in `Stage2_REVERSE.py`, `Modules/reverse_pacx_lit.py`, and `Data/stage2_data.py`; encoder and preprocessing definitions were extracted into separate import-safe files. Only synthetic-data implementation checks have run. Real checkpoint compatibility and paired-data loading still need to be confirmed once those files are available.
-
 ## Preserved drafts
 
 - `resources/drafts/before_original_copy_20261015_185351_523232/Stage1_MAE.py`
