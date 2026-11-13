@@ -1,124 +1,147 @@
-import os
-from torch.utils.data import Dataset
-from PIL import Image
+"""Stage-specific inputs. SYMILE test access is restricted to Stage 3 callers."""
+
+from pathlib import Path
+import numpy as np
 import pandas as pd
+from PIL import Image
 import torch
-import torchvision.transforms as T
+from torch.utils.data import Dataset
+from torchvision import transforms as T
+from torchvision.transforms import functional as TF
+from .ecg_preprocessing import preprocess_ecg
+from .targets import TARGETS
+
 
 class ChestXrayDataset(Dataset):
-    def __init__(self, df, root_dir, transform=None, labels = [], path_index = "Path"):
-        self.df = df
-        self.root_dir = root_dir
-        self.transform = transform
-        self.path_index = path_index
-
-        if labels is not None and len(labels) > 0:
-            self.label_cols = labels
-            self.with_labels = True
-
-            # Convert to numeric
-            self.df[self.label_cols] = self.df[self.label_cols].apply(
-                pd.to_numeric, errors="coerce"
+    def __init__(self, root, split, image_size=224):
+        root = Path(root)
+        batch1 = root / "CheXpert-v1.0 batch 1 (validate & csv)"
+        metadata = pd.read_csv(batch1 / f"{split}.csv")
+        patients = {}
+        for folder in root.glob("CheXpert-v1.0 batch *"):
+            for patient in folder.glob("patient*"):
+                if patient.is_dir():
+                    patients[patient.name] = patient
+        self.paths = []
+        self.subject_ids = []
+        for value in metadata["Path"]:
+            patient, study, image = Path(value).parts[-3:]
+            base = (
+                patients.get(patient)
+                if split == "train"
+                else batch1 / "valid" / patient
+            )
+            if base is None or not (base / study / image).is_file():
+                raise FileNotFoundError(f"Cannot resolve CheXpert image {value}")
+            self.paths.append(base / study / image)
+            self.subject_ids.append(patient)
+        normalize = T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        if split == "train":
+            self.transform = T.Compose(
+                [
+                    T.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
+                    T.RandomHorizontalFlip(),
+                    T.ToTensor(),
+                    normalize,
+                ]
+            )
+        else:
+            self.transform = T.Compose(
+                [T.Resize((image_size, image_size)), T.ToTensor(), normalize]
             )
 
-            # Detect NaNs BEFORE filling
-            for col in self.label_cols:
-                nan_idx = self.df[self.df[col].isna()].index.tolist()
-                if len(nan_idx) > 0:
-                    print(f"[WARNING] Column '{col}' contains NaN at indices: {nan_idx[:10]} "
-                        f"(showing first 10). Total = {len(nan_idx)}")
+    def __len__(self):
+        return len(self.paths)
 
-            # Fill NaNs
-            self.df[self.label_cols] = self.df[self.label_cols].fillna(0).astype("int64")
+    def __getitem__(self, index):
+        with Image.open(self.paths[index]) as image:
+            return self.transform(image.convert("RGB"))
 
-            # Verify again after fill
-            for col in self.label_cols:
-                if self.df[col].isna().any():
-                    raise ValueError(f"[ERROR] Column '{col}' STILL contains NaNs after fill().")
+
+class SymileMIMICDataset(Dataset):
+    def __init__(self, root, split, stage):
+        if stage not in ("labs", "distillation", "classification"):
+            raise ValueError("Unknown stage")
+        if split not in ("train", "val", "test"):
+            raise ValueError("Unknown split")
+        if split == "test" and stage != "classification":
+            raise ValueError("SYMILE test data is reserved for Stage 3.")
+        self.stage = stage
+        self.split = split
+        root = Path(root)
+        folder = root / "data_npy" / split
+        # Earlier stages read no test metadata or test arrays.
+        ids = np.load(folder / f"hadm_id_{split}.npy", mmap_mode="r").reshape(-1)
+        self.metadata = pd.read_csv(root / f"{split}.csv")
+        if not np.array_equal(ids, self.metadata.hadm_id.to_numpy()):
+            raise ValueError("CSV and NPY admission order differs")
+        self.metadata["array_index"] = np.arange(len(ids))
+        if split == "test":
+            self.metadata = self.metadata.loc[self.metadata.label.eq(1)].copy()
+            if not self.metadata.hadm_id.eq(self.metadata.label_hadm_id).all():
+                raise ValueError("Retrieval positives have mismatched IDs")
+        self.metadata = self.metadata.reset_index(drop=True)
+        if self.metadata.empty or self.metadata.hadm_id.duplicated().any():
+            raise ValueError("Admissions must be nonempty and unique")
+        self.indices = self.metadata.array_index.to_numpy()
+        self.subject_ids = self.metadata.subject_id.to_numpy()
+        self.labs = np.load(folder / f"labs_percentiles_{split}.npy", mmap_mode="r")
+        self.observed = np.load(folder / f"labs_missingness_{split}.npy", mmap_mode="r")
+        if self.labs.shape != (len(ids), 50) or self.observed.shape != self.labs.shape:
+            raise ValueError("Expected 50 lab values and observation indicators")
+        if not np.isin(self.observed, [0, 1]).all():
+            raise ValueError("Expected observed=1, missing=0")
+        if stage != "labs":
+            self.ecg = np.load(folder / f"ecg_{split}.npy", mmap_mode="r")
+            if self.ecg.shape != (len(ids), 1, 5000, 12):
+                raise ValueError("Unexpected ECG array shape")
+        if stage == "distillation":
+            self.cxr = np.load(folder / f"cxr_{split}.npy", mmap_mode="r")
+            if self.cxr.shape != (len(ids), 3, 320, 320):
+                raise ValueError("Unexpected CXR array shape")
+        if stage == "classification":
+            self.raw_labels = self.metadata[TARGETS].to_numpy(dtype=np.float32)
+            if not (
+                np.isnan(self.raw_labels) | np.isin(self.raw_labels, [-1, 0, 1])
+            ).all():
+                raise ValueError("Unexpected target values")
+            self.label_mask = np.isin(self.raw_labels, [0, 1])
+            self.labels = np.where(self.label_mask, self.raw_labels, 0).astype(
+                np.float32
+            )
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        row = int(self.indices[index])
+        x = torch.tensor(self.labs[row], dtype=torch.float32)
+        mask = torch.tensor(self.observed[row], dtype=torch.float32)
+        x = torch.where(mask.bool(), x, 0.0)
+        if self.stage == "labs":
+            return x, mask
+        result = {
+            "ecg": torch.from_numpy(preprocess_ecg(self.ecg[row])),
+            "labs": x,
+            "labs_mask": mask,
+            "hadm_id": torch.tensor(int(self.metadata.hadm_id.iloc[index])),
+        }
+        if self.stage == "distillation":
+            image = torch.tensor(self.cxr[row], dtype=torch.float32)
+            result["cxr"] = TF.resize(image, [224, 224], antialias=True)
         else:
-            self.with_labels = False
+            result["labels"] = torch.from_numpy(self.labels[index].copy())
+            result["label_mask"] = torch.from_numpy(self.label_mask[index].copy())
+        return result
 
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-
-        img_path = os.path.join(self.root_dir, row[self.path_index])
-        image = Image.open(img_path).convert("RGB")
-
-        if self.transform is not None:
-            image = self.transform(image)
-
-        if not self.with_labels:
-            return image
-
-        labels_np = row[self.label_cols].to_numpy(dtype="float32")
-        labels = torch.from_numpy(labels_np)
-
-        return image, labels
-    
-class CXRSegDataset(Dataset):
-    """
-    CXLSeg segmentation dataset: returns (image, mask).
-
-    CSV format:
-        dicom_id    subject_id  study_id    split
-    Paths:
-        image: root / subject_id / study_id / dicom_id.jpg
-        mask : root / subject_id / study_id / dicom_id-mask.jpg
-    """
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        images_root: str,
-        transform=None,
-        image_size: int = 224,
-    ):
-        self.df = df.reset_index(drop=True)
-        self.images_root = images_root
-        self.transform = transform
-        self.image_size = image_size
-
-        self.to_tensor = T.ToTensor()
-        self.resize = T.Resize((image_size, image_size))
-        self.img_normalize = T.Normalize(
-            mean=(0.485, 0.456, 0.406),
-            std=(0.229, 0.224, 0.225),
+    def label_counts(self, limit=None):
+        raw_labels = self.raw_labels[:limit]
+        return pd.DataFrame(
+            {
+                "finding": TARGETS,
+                "positive": (raw_labels == 1).sum(0),
+                "negative": (raw_labels == 0).sum(0),
+                "uncertain": (raw_labels == -1).sum(0),
+                "unreported": np.isnan(raw_labels).sum(0),
+            }
         )
-
-    def __len__(self):
-        return len(self.df)
-
-    def _get_paths(self, idx: int):
-        row = self.df.iloc[idx]
-        img_path = str(row["img_path"])
-        mask_path = str(row["mask_path"])
-
-        img_path = os.path.join(self.images_root, img_path)
-        mask_path = os.path.join(self.images_root, mask_path)
-
-        return img_path, mask_path
-
-    def __getitem__(self, idx: int):
-        img_path, mask_path = self._get_paths(idx)
-
-        img = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")
-
-        # Resize
-        img = self.resize(img)
-        mask = self.resize(mask)
-
-        # Paired aug
-        if self.transform is not None:
-            img, mask = self.transform(img, mask)
-
-        # To tensor
-        img = self.to_tensor(img)          # [3, H, W], 0–1
-        mask = self.to_tensor(mask)        # [1, H, W], 0–1
-        mask = (mask > 0.5).float()        # binarize
-
-        img = self.img_normalize(img)
-
-        return img, mask

@@ -44,7 +44,7 @@ class MAELightningModule(pl.LightningModule):
         return loss
 
     def forward(self, imgs):
-        return self.model(imgs)
+        return self.model(imgs, mask_ratio=self.hparams.mask_ratio)
 
     def encode(self, imgs):
         return self.model.encode(imgs)
@@ -56,7 +56,7 @@ class MAELightningModule(pl.LightningModule):
         self.log('train/loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def _validation_step(self, batch, batch_idx):
         imgs = batch[0] if isinstance(batch, (list, tuple)) else batch
         _, pred, mask = self(imgs)
         loss = self.forward_loss(imgs, pred, mask)
@@ -70,6 +70,12 @@ class MAELightningModule(pl.LightningModule):
         ):
             self._log_reconstructions(imgs, pred)
         return loss
+
+    def validation_step(self, batch, batch_idx):
+        devices = [self.device.index] if self.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(42 + batch_idx)
+            return self._validation_step(batch, batch_idx)
 
     # ----- helpers -----
     @torch.no_grad()
